@@ -1,0 +1,49 @@
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Airflow logs
+logs/
+
+# Data files (contains actual stock data)
+data/**/*.xlsx
+data/processed/
+!data/.gitkeep
+!data/*/.gitkeep
+!data/README.md
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Backup files
+*.bak
+*~
+
+# Keep .disabled files (for future use like ELT)
+!*.disabled
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+env/

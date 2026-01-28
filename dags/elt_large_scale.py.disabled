@@ -1,0 +1,169 @@
+from datetime import datetime, timedelta
+
+from airflow import DAG
+from airflow.sensors.python import PythonSensor
+from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+
+from utils.file_watcher import (
+    check_files,
+    move_to_processed,
+    MARKET_PRICE_DIR,
+    PER_DATA_DIR,
+    MARKET_PRICE_PATTERN,
+    PER_DATA_PATTERN,
+)
+from utils.extract import extract
+from utils.load import load_to_bronze_task
+
+
+def cleanup_files(**context):
+    """처리 완료된 파일을 processed 폴더로 이동"""
+    ti = context['ti']
+    market_files = ti.xcom_pull(key='marketPrice_files') or []
+    per_files = ti.xcom_pull(key='perData_files') or []
+
+    if market_files:
+        move_to_processed(market_files, MARKET_PRICE_DIR)
+    if per_files:
+        move_to_processed(per_files, PER_DATA_DIR)
+
+
+# Bronze → Silver 변환 SQL
+TRANSFORM_DAILY_PRICE_SQL = """
+INSERT INTO stock.silver_daily_price (
+    stock_code, stock_name, close_price, change_amount, change_rate,
+    open_price, high_price, low_price, volume, trade_value,
+    market_cap, shares_outstanding, trade_date
+)
+SELECT
+    stock_code,
+    stock_name,
+    NULLIF(close_price, 'nan')::BIGINT,
+    NULLIF(change_amount, 'nan')::BIGINT,
+    NULLIF(change_rate, 'nan')::DECIMAL(10, 2),
+    NULLIF(open_price, 'nan')::BIGINT,
+    NULLIF(high_price, 'nan')::BIGINT,
+    NULLIF(low_price, 'nan')::BIGINT,
+    NULLIF(volume, 'nan')::BIGINT,
+    NULLIF(trade_value, 'nan')::BIGINT,
+    NULLIF(market_cap, 'nan')::BIGINT,
+    NULLIF(shares_outstanding, 'nan')::BIGINT,
+    CURRENT_DATE
+FROM stock.bronze_daily_price
+WHERE created_at >= CURRENT_DATE
+ON CONFLICT (stock_code, trade_date) DO UPDATE SET
+    close_price = EXCLUDED.close_price,
+    change_amount = EXCLUDED.change_amount,
+    change_rate = EXCLUDED.change_rate,
+    open_price = EXCLUDED.open_price,
+    high_price = EXCLUDED.high_price,
+    low_price = EXCLUDED.low_price,
+    volume = EXCLUDED.volume,
+    trade_value = EXCLUDED.trade_value,
+    market_cap = EXCLUDED.market_cap,
+    shares_outstanding = EXCLUDED.shares_outstanding;
+"""
+
+TRANSFORM_VALUATION_SQL = """
+INSERT INTO stock.silver_valuation (
+    stock_code, stock_name, close_price, eps, per,
+    forward_eps, forward_per, bps, pbr, dividend_yield, trade_date
+)
+SELECT
+    stock_code,
+    stock_name,
+    NULLIF(close_price, 'nan')::BIGINT,
+    NULLIF(NULLIF(eps, '-'), 'nan')::DECIMAL(15, 2),
+    NULLIF(NULLIF(per, '-'), 'nan')::DECIMAL(10, 2),
+    NULLIF(NULLIF(forward_eps, '-'), 'nan')::DECIMAL(15, 2),
+    NULLIF(NULLIF(forward_per, '-'), 'nan')::DECIMAL(10, 2),
+    NULLIF(NULLIF(bps, '-'), 'nan')::DECIMAL(15, 2),
+    NULLIF(NULLIF(pbr, '-'), 'nan')::DECIMAL(10, 2),
+    NULLIF(NULLIF(dividend_yield, '-'), 'nan')::DECIMAL(10, 2),
+    CURRENT_DATE
+FROM stock.bronze_valuation
+WHERE created_at >= CURRENT_DATE
+ON CONFLICT (stock_code, trade_date) DO UPDATE SET
+    close_price = EXCLUDED.close_price,
+    eps = EXCLUDED.eps,
+    per = EXCLUDED.per,
+    forward_eps = EXCLUDED.forward_eps,
+    forward_per = EXCLUDED.forward_per,
+    bps = EXCLUDED.bps,
+    pbr = EXCLUDED.pbr,
+    dividend_yield = EXCLUDED.dividend_yield;
+"""
+
+
+with DAG(
+    dag_id='stock_elt',
+    description='주식 데이터 ELT 파이프라인',
+    start_date=datetime(2026, 1, 1),
+    schedule_interval=None,
+    catchup=False,
+    default_args={
+        'retries': 1,
+        'retry_delay': timedelta(minutes=5),
+    },
+) as dag:
+
+    # 1. 파일 감시 (병렬)
+    wait_market_price = PythonSensor(
+        task_id='wait_market_price_file',
+        python_callable=check_files,
+        op_kwargs={
+            'directory': MARKET_PRICE_DIR,
+            'pattern': MARKET_PRICE_PATTERN,
+        },
+        poke_interval=60,
+        timeout=60 * 60 * 24,
+        mode='poke',
+    )
+
+    wait_per_data = PythonSensor(
+        task_id='wait_per_data_file',
+        python_callable=check_files,
+        op_kwargs={
+            'directory': PER_DATA_DIR,
+            'pattern': PER_DATA_PATTERN,
+        },
+        poke_interval=60,
+        timeout=60 * 60 * 24,
+        mode='poke',
+    )
+
+    # 2. Extract: 데이터 읽기
+    extract_task = PythonOperator(
+        task_id='extract',
+        python_callable=extract,
+    )
+
+    # 3. Load: Bronze 테이블에 원본 저장
+    load_bronze_task = PythonOperator(
+        task_id='load_to_bronze',
+        python_callable=load_to_bronze_task,
+    )
+
+    # 4. Transform: DB에서 SQL로 Bronze → Silver 변환
+    transform_daily_price = PostgresOperator(
+        task_id='transform_daily_price',
+        postgres_conn_id='postgres_default',
+        sql=TRANSFORM_DAILY_PRICE_SQL,
+    )
+
+    transform_valuation = PostgresOperator(
+        task_id='transform_valuation',
+        postgres_conn_id='postgres_default',
+        sql=TRANSFORM_VALUATION_SQL,
+    )
+
+    # 5. Cleanup: 처리 완료 파일 이동
+    cleanup_task = PythonOperator(
+        task_id='cleanup_files',
+        python_callable=cleanup_files,
+    )
+
+    # 그래프 연결
+    [wait_market_price, wait_per_data] >> extract_task >> load_bronze_task
+    load_bronze_task >> [transform_daily_price, transform_valuation] >> cleanup_task
